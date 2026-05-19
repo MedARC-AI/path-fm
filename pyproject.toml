@@ -21,7 +21,7 @@ dependencies = [
     "torchmetrics>=1.8.0",
     "wandb>=0.21.0",
     "huggingface-hub==1.2.3",
-    "torch==2.8.0",
+    "torch==2.9.0",
     "torchvision",
     "xformers>=0.0.32.post2",
     # for Eva benchmarking:
@@ -59,6 +59,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+norecursedirs = ["tests/scripts"]
 
 [tool.uv.pip]
 # Use uv's auto detection when installing via `uv pip`
@@ -68,11 +69,11 @@ torch-backend = "auto"
 exclude-dependencies = ["pillow"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-xformers = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+xformers = { index = "pytorch-cu129" }
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
