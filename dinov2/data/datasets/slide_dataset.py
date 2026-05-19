@@ -2,6 +2,7 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
+import os
 from typing import Any, Tuple
 from .extended import ExtendedVisionDataset
 from pathlib import Path
@@ -35,6 +36,8 @@ class SlideDataset(ExtendedVisionDataset):
         y = int(y)
         level = int(level)
 
+        tss_code = os.path.basename(path).split('-')[1]
+
         image = OpenSlide(path)
 
         patch_size = 224
@@ -46,9 +49,9 @@ class SlideDataset(ExtendedVisionDataset):
 
         res = patch.convert("RGB") # Removes alpha - not sure this is the best way to do this thuogh
         if self.transforms is not None:
-            return self.transforms(res, None), index
+            return self.transforms(res, None), index, tss_code
 
-        return res, None, index
+        return res, None, index, tss_code
         
     def hsv(self, tile_rgb, patch_size):
         tile = np.array(tile_rgb)
