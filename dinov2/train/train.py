@@ -992,9 +992,9 @@ def do_train(cfg, model, resume=False):
     if not cfg.train.skip_checkpointer:
         periodic_checkpointer = PeriodicCheckpointer(
             checkpointer,
-            period=5 * OFFICIAL_EPOCH_LENGTH,
+            period=4 * OFFICIAL_EPOCH_LENGTH,
             max_iter=max_iter,
-            max_to_keep=1,
+            max_to_keep=10,
         )
 
     # setup data preprocessing
@@ -1248,6 +1248,8 @@ def do_train(cfg, model, resume=False):
                 "Last Layer LR": last_layer_lr,
                 "Total Loss": losses_reduced,
             }
+            if cfg.adversarial.loss_weight > 0:
+                scalar_logs["lambda_adv"] = cfg.adversarial.loss_weight
             wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
     
         # Synchronize the GPU to ensure all operations are complete before measuring
@@ -1258,10 +1260,40 @@ def do_train(cfg, model, resume=False):
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+def _build_tss_mapping(cfg):
+    from collections import defaultdict
+    wsi_per_tss = defaultdict(set)
+    tile_per_tss = defaultdict(int)
+    with open(cfg.train.sample_list_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            path = parts[0]
+            tss = os.path.basename(path).split('-')[1]
+            wsi_per_tss[tss].add(path)
+            tile_per_tss[tss] += 1
+    min_wsi = cfg.adversarial.min_wsi_count
+    all_tss_codes = sorted(tss for tss, wsids in wsi_per_tss.items() if len(wsids) >= min_wsi)
+    tile_counts = torch.tensor([tile_per_tss[tss] for tss in all_tss_codes], dtype=torch.float32)
+    class_weights = 1.0 / tile_counts
+    class_weights = class_weights / class_weights.mean()
+    logger.info(f"TSS mapping: {len(all_tss_codes)} codes with >= {min_wsi} WSIs (out of {len(wsi_per_tss)} total)")
+    return all_tss_codes, class_weights
+
+
 def main(args):
     cfg = setup(args)
     print(cfg)
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
+
+    all_tss_codes, class_weights = [], None
+    if cfg.adversarial.loss_weight > 0:
+        assert not cfg.train.streaming_from_hf, (
+            "Adversarial TSS training requires WSI data path (streaming_from_hf must be false)"
+        )
+        all_tss_codes, class_weights = _build_tss_mapping(cfg)
+
+    model = SSLMetaArch(cfg, all_tss_codes=all_tss_codes, class_weights=class_weights).to(torch.device("cuda"))
     #Load model here from pretrained.
     if cfg.train.use_pretrained:
         _load_pretrained_backbone(cfg, model)
