@@ -173,8 +173,9 @@ def test_update_teacher_ema_skips_slide_classifier():
             teacher_param_list += mt.params
 
     m = 0.9
-    torch._foreach_mul_(teacher_param_list, m)
-    torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
+    with torch.no_grad():
+        torch._foreach_mul_(teacher_param_list, m)
+        torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
 
     # backbone teacher: 0 * 0.9 + 1 * 0.1 = 0.1
     assert torch.allclose(teacher_backbone.weight, torch.full_like(teacher_backbone.weight, 0.1))

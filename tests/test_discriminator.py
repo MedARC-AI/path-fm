@@ -96,6 +96,10 @@ def test_slide_classifier_gradients_reversed():
     # Copy identical weights
     m_double.load_state_dict(m_adv.state_dict())
 
+    # eval() disables Dropout so both passes use the same computation path
+    m_adv.eval()
+    m_double.eval()
+
     x_adv = x.clone().requires_grad_(True)
     x_double = x.clone().requires_grad_(True)
 

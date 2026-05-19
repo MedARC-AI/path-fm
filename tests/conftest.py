@@ -1,3 +1,5 @@
+import sys
+from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn as nn
