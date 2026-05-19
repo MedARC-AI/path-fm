@@ -23,7 +23,7 @@ train:
   OFFICIAL_EPOCH_LENGTH: 1250
   num_workers: 24 # set to 4 if streaming_from_hf=True
   prefetch_factor: 8
-  skip_checkpointer: true # set True if you don't need to resume training (this yields training speedup and less space usage)
+  skip_checkpointer: false
 student:
   arch: vit_giant2
   patch_size: 14
@@ -49,3 +49,10 @@ evaluation:
   bach_root: /block/eva-data/bach
   breakhis_root: /block/eva-data/breakhis
   pcam_root: /block/eva-data/patch_camelyon
+adversarial:
+  loss_weight: 50.0
+  alpha: 1.0
+  hidden_dim: 256
+  average_crop: false
+  local_crop_weight: 1.0
+  min_wsi_count: 10
