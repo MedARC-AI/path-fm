@@ -7,10 +7,13 @@ from functools import partial
 import logging
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.cuda.amp import autocast
 
 from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss, KDELoss
 from dinov2.models import build_model_from_cfg
+from dinov2.models.discriminator import SlideClassifier
 from dinov2.layers import DINOHead
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
@@ -29,7 +32,7 @@ logger = logging.getLogger("dinov2")
 
 
 class SSLMetaArch(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, all_tss_codes=None, class_weights=None):
         super().__init__()
         self.cfg = cfg
         self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
@@ -54,6 +57,7 @@ class SSLMetaArch(nn.Module):
         self.do_koleo = cfg.dino.koleo_loss_weight > 0
         self.do_kde = cfg.dino.kde_loss_weight > 0
         self.do_ibot = cfg.ibot.loss_weight > 0
+        self.do_adv = cfg.adversarial.loss_weight > 0
         self.ibot_separate_head = cfg.ibot.separate_head
 
         logger.info("OPTIONS -- DINO")
@@ -113,6 +117,23 @@ class SSLMetaArch(nn.Module):
                 teacher_model_dict["ibot_head"] = ibot_head()
             else:
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
+
+        logger.info("OPTIONS -- ADVERSARIAL")
+        if self.do_adv:
+            assert all_tss_codes, "all_tss_codes must be provided when adversarial.loss_weight > 0"
+            logger.info(f"OPTIONS -- ADVERSARIAL -- loss_weight: {cfg.adversarial.loss_weight}")
+            logger.info(f"OPTIONS -- ADVERSARIAL -- alpha: {cfg.adversarial.alpha}")
+            logger.info(f"OPTIONS -- ADVERSARIAL -- n_tss_codes: {len(all_tss_codes)}")
+            self.tss_to_idx = {tss: idx for idx, tss in enumerate(sorted(all_tss_codes))}
+            num_classes = len(self.tss_to_idx)
+            self.slide_classifier = SlideClassifier(embed_dim, cfg.adversarial.hidden_dim, num_classes, cfg.adversarial.alpha)
+            student_model_dict["slide_classifier"] = self.slide_classifier
+            self.adversarial_loss_weight = cfg.adversarial.loss_weight
+            self.adversarial_local_crop_weight = cfg.adversarial.local_crop_weight
+            if class_weights is not None:
+                self.register_buffer("adv_class_weights", class_weights)
+            else:
+                self.adv_class_weights = None
 
         self.need_to_synchronize_fsdp_streams = True
 
@@ -355,6 +376,35 @@ class SSLMetaArch(nn.Module):
             # accumulate loss
             loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
+        # Adversarial loss
+        if self.do_adv:
+            slide_ids = images["slide_ids"]
+            adversarial_labels = torch.tensor(
+                [self.tss_to_idx.get(tss, -1) for tss in slide_ids],
+                dtype=torch.long,
+                device=global_crops.device,
+            )
+            # If every sample in the batch has an excluded TSS code, skip to avoid NaN from
+            # F.cross_entropy(reduction='mean') dividing by zero valid samples.
+            if (adversarial_labels >= 0).any():
+                # collate ordering: outer=crop, inner=sample → use repeat (not repeat_interleave)
+                global_slide_ids = adversarial_labels.repeat(n_global_crops)
+                local_slide_ids = adversarial_labels.repeat(n_local_crops)
+
+                with autocast(dtype=torch.float16):
+                    global_slide_preds = self.student.slide_classifier(student_global_cls_tokens)
+                    local_slide_preds = self.student.slide_classifier(student_local_cls_tokens)
+
+                    global_adv_loss = F.cross_entropy(global_slide_preds, global_slide_ids, weight=self.adv_class_weights, ignore_index=-1)
+                    local_adv_loss = F.cross_entropy(local_slide_preds, local_slide_ids, weight=self.adv_class_weights, ignore_index=-1)
+
+                    adv_loss = global_adv_loss + self.adversarial_local_crop_weight * local_adv_loss
+
+                loss_dict["global_adv_loss"] = global_adv_loss
+                loss_dict["local_adv_loss"] = local_adv_loss
+
+                loss_accumulator += self.adversarial_loss_weight * adv_loss
+
         self.backprop_loss(loss_accumulator)
 
         self.fsdp_synchronize_streams()
@@ -376,6 +426,8 @@ class SSLMetaArch(nn.Module):
         teacher_param_list = []
         with torch.no_grad():
             for k in self.student.keys():
+                if k == "slide_classifier":
+                    continue
                 for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
                     student_param_list += ms.params
                     teacher_param_list += mt.params
@@ -411,8 +463,13 @@ class SSLMetaArch(nn.Module):
             raise NotImplementedError
         # below will synchronize all student subnetworks across gpus:
         for k, v in self.student.items():
-            self.teacher[k].load_state_dict(self.student[k].state_dict())
-            student_model_cfg = self.cfg.compute_precision.student[k]
-            self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
-            teacher_model_cfg = self.cfg.compute_precision.teacher[k]
-            self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
+            if k != "slide_classifier":
+                self.teacher[k].load_state_dict(self.student[k].state_dict())
+                student_model_cfg = self.cfg.compute_precision.student[k]
+                self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
+                teacher_model_cfg = self.cfg.compute_precision.teacher[k]
+                self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
+            else:
+                # teacher has no slide_classifier; FSDP-wrap student only (matches advdino pattern)
+                student_model_cfg = self.cfg.compute_precision.student[k]
+                self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
