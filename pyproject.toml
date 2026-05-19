@@ -50,6 +50,16 @@ include = ["dinov2*"]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
 [tool.uv.pip]
 # Use uv's auto detection when installing via `uv pip`
 torch-backend = "auto"
