@@ -31,6 +31,21 @@ except ImportError:
 logger = logging.getLogger("dinov2")
 
 
+def compute_adv_accuracy(
+    preds: torch.Tensor, labels: torch.Tensor, valid_mask: torch.Tensor
+) -> torch.Tensor:
+    """Classification accuracy over valid (non-ignored) samples."""
+    return (preds[valid_mask].argmax(dim=-1) == labels[valid_mask]).float().mean()
+
+
+def compute_grad_norm(module: nn.Module) -> torch.Tensor:
+    """L2 norm of all gradients in a module (0 if no grads)."""
+    grads = [p.grad for p in module.parameters() if p.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+    return torch.cat([g.flatten() for g in grads]).norm(2)
+
+
 class SSLMetaArch(nn.Module):
     def __init__(self, cfg, all_tss_codes=None, class_weights=None):
         super().__init__()
@@ -154,6 +169,23 @@ class SSLMetaArch(nn.Module):
         else:
             loss.backward()
 
+    @torch.no_grad()
+    def _compute_grad_norms(self) -> dict[str, torch.Tensor]:
+        """Gradient L2 norms for the backbone vs discriminator after backward.
+
+        Under FSDP each rank holds a shard; all-reducing and dividing by world_size
+        gives the average-shard norm, not the global L2 norm. The ratio is still a
+        valid monotone signal for comparing backbone vs discriminator magnitude.
+        """
+        norms: dict[str, torch.Tensor] = {}
+        backbone_norm = compute_grad_norm(self.student.backbone)
+        disc_norm = compute_grad_norm(self.student.slide_classifier)
+        norms["grad_norm_backbone"] = backbone_norm
+        norms["grad_norm_discriminator"] = disc_norm
+        if disc_norm > 0:
+            norms["grad_norm_ratio_backbone_disc"] = backbone_norm / disc_norm
+        return norms
+
     def forward_backward(self, images, teacher_temp):
         n_global_crops = 2
         assert n_global_crops == 2
@@ -255,6 +287,7 @@ class SSLMetaArch(nn.Module):
         reshard_fsdp_model(self.teacher)
 
         loss_dict = {}
+        metrics_dict = {}
 
         loss_accumulator = 0  # for backprop
         student_global_backbone_output_dict, student_local_backbone_output_dict = self.student.backbone(
@@ -403,13 +436,24 @@ class SSLMetaArch(nn.Module):
                 loss_dict["global_adv_loss"] = global_adv_loss
                 loss_dict["local_adv_loss"] = local_adv_loss
 
+                valid_mask = adversarial_labels >= 0
+                global_valid = valid_mask.repeat(n_global_crops)
+                local_valid = valid_mask.repeat(n_local_crops)
+                metrics_dict["global_adv_accuracy"] = compute_adv_accuracy(
+                    global_slide_preds, global_slide_ids, global_valid
+                )
+                metrics_dict["local_adv_accuracy"] = compute_adv_accuracy(
+                    local_slide_preds, local_slide_ids, local_valid
+                )
+                metrics_dict["adv_valid_label_fraction"] = valid_mask.float().mean()
+
                 loss_accumulator += self.adversarial_loss_weight * adv_loss
 
         self.backprop_loss(loss_accumulator)
 
         self.fsdp_synchronize_streams()
 
-        return loss_dict
+        return loss_dict, metrics_dict
 
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
