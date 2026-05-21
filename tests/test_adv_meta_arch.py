@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from unittest.mock import patch, MagicMock
 
+from dinov2.train.ssl_meta_arch import compute_adv_accuracy, compute_grad_norm
+
 
 # ── tss_to_idx mapping ────────────────────────────────────────────────────────
 
@@ -181,3 +183,116 @@ def test_update_teacher_ema_skips_slide_classifier():
     assert torch.allclose(teacher_backbone.weight, torch.full_like(teacher_backbone.weight, 0.1))
     # slide_classifier student must be untouched
     assert torch.allclose(slide_classifier.weight.data, sc_weight_original)
+
+
+# ── compute_adv_accuracy ─────────────────────────────────────────────────────
+
+def test_compute_adv_accuracy_perfect():
+    """All predictions correct → accuracy 1.0."""
+    preds = torch.tensor([[10.0, 0.0, 0.0],
+                          [0.0, 10.0, 0.0],
+                          [0.0, 0.0, 10.0]])
+    labels = torch.tensor([0, 1, 2])
+    valid = torch.tensor([True, True, True])
+    assert compute_adv_accuracy(preds, labels, valid).item() == pytest.approx(1.0)
+
+
+def test_compute_adv_accuracy_none_correct():
+    """All predictions wrong → accuracy 0.0."""
+    preds = torch.tensor([[0.0, 10.0],
+                          [10.0, 0.0]])
+    labels = torch.tensor([0, 1])
+    valid = torch.tensor([True, True])
+    assert compute_adv_accuracy(preds, labels, valid).item() == pytest.approx(0.0)
+
+
+def test_compute_adv_accuracy_partial_valid():
+    """Only valid samples contribute to accuracy."""
+    preds = torch.tensor([[10.0, 0.0],   # correct (valid)
+                          [10.0, 0.0],   # wrong, but ignored
+                          [0.0, 10.0]])  # correct (valid)
+    labels = torch.tensor([0, 1, 1])
+    valid = torch.tensor([True, False, True])
+    assert compute_adv_accuracy(preds, labels, valid).item() == pytest.approx(1.0)
+
+
+def test_compute_adv_accuracy_half_correct():
+    """2 out of 4 correct → 0.5."""
+    preds = torch.tensor([[10.0, 0.0],   # correct
+                          [10.0, 0.0],   # wrong
+                          [0.0, 10.0],   # correct
+                          [0.0, 10.0]])  # wrong
+    labels = torch.tensor([0, 1, 1, 0])
+    valid = torch.ones(4, dtype=torch.bool)
+    assert compute_adv_accuracy(preds, labels, valid).item() == pytest.approx(0.5)
+
+
+# ── compute_grad_norm ────────────────────────────────────────────────────────
+
+def test_compute_grad_norm_known_values():
+    """L2 norm of known gradient vectors."""
+    model = nn.Linear(4, 2, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 0.0, 0.0, 0.0],
+                                       [0.0, 4.0, 0.0, 0.0]])
+    # flattened: [3, 0, 0, 0, 0, 4, 0, 0] → norm = 5.0
+    assert compute_grad_norm(model).item() == pytest.approx(5.0)
+
+
+def test_compute_grad_norm_with_bias():
+    """Includes bias gradients in the norm."""
+    model = nn.Linear(1, 1, bias=True)
+    model.weight.grad = torch.tensor([[3.0]])
+    model.bias.grad = torch.tensor([4.0])
+    # [3, 4] → norm = 5.0
+    assert compute_grad_norm(model).item() == pytest.approx(5.0)
+
+
+def test_compute_grad_norm_no_grads():
+    """Module with no gradients returns 0."""
+    model = nn.Linear(4, 2)
+    assert compute_grad_norm(model).item() == pytest.approx(0.0)
+
+
+def test_compute_grad_norm_partial_grads():
+    """Only parameters with .grad set contribute."""
+    model = nn.Linear(1, 1, bias=True)
+    model.weight.grad = torch.tensor([[3.0]])
+    # bias.grad is None → only weight contributes
+    assert compute_grad_norm(model).item() == pytest.approx(3.0)
+
+
+def test_compute_grad_norm_multi_layer():
+    """Works across a module with multiple sub-layers."""
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 1, bias=False))
+    model[0].weight.grad = torch.zeros(2, 2)
+    model[0].weight.grad[0, 0] = 3.0
+    model[1].weight.grad = torch.zeros(1, 2)
+    model[1].weight.grad[0, 0] = 4.0
+    # flattened: [3, 0, 0, 0, 4, 0] → norm = 5.0
+    assert compute_grad_norm(model).item() == pytest.approx(5.0)
+
+
+# ── valid_label_fraction ─────────────────────────────────────────────────────
+
+def test_valid_label_fraction_all_valid():
+    labels = torch.tensor([0, 1, 2, 3])
+    fraction = (labels >= 0).float().mean()
+    assert fraction.item() == pytest.approx(1.0)
+
+
+def test_valid_label_fraction_some_ignored():
+    labels = torch.tensor([0, -1, 2, -1, 4, -1, 6, -1, 8, -1])
+    fraction = (labels >= 0).float().mean()
+    assert fraction.item() == pytest.approx(0.5)
+
+
+def test_valid_label_fraction_seven_of_ten():
+    labels = torch.tensor([0, 1, 2, -1, 4, 5, 6, -1, 8, -1])
+    fraction = (labels >= 0).float().mean()
+    assert fraction.item() == pytest.approx(0.7)
+
+
+def test_valid_label_fraction_none_valid():
+    labels = torch.tensor([-1, -1, -1])
+    fraction = (labels >= 0).float().mean()
+    assert fraction.item() == pytest.approx(0.0)
