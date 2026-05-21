@@ -953,7 +953,7 @@ def do_train(cfg, model, resume=False):
             run_id_path.write_text(run_id)
             resume_mode = "allow"
         run = wandb.init(
-            project="tcga-finetuning",
+            project="open-midnight",
             config=OmegaConf.to_container(cfg),
             id=run_id,
             resume=resume_mode,
