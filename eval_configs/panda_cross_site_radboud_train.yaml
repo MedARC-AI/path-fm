@@ -1,0 +1,100 @@
+---
+trainer:
+  class_path: eva.Trainer
+  init_args:
+    n_runs: 1
+    default_root_dir: &OUTPUT_ROOT ${oc.env:OUTPUT_ROOT, logs/openmidnight/cross_site/radboud_train}
+    max_epochs: &MAX_EPOCHS ${oc.env:MAX_EPOCHS, 20}
+    checkpoint_type: ${oc.env:CHECKPOINT_TYPE, best}
+    accelerator: ${oc.env:ACCELERATOR, auto}
+    devices: ${oc.env:NUM_DEVICES, 1}
+    callbacks:
+      - class_path: eva.callbacks.ConfigurationLogger
+      - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+        init_args:
+          refresh_rate: ${oc.env:TQDM_REFRESH_RATE, 1}
+      - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+        init_args:
+          logging_interval: epoch
+      - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+        init_args:
+          filename: best
+          save_last: ${oc.env:SAVE_LAST, false}
+          save_top_k: 1
+          monitor: &MONITOR_METRIC ${oc.env:MONITOR_METRIC, val/AverageLoss}
+          mode: &MONITOR_METRIC_MODE ${oc.env:MONITOR_METRIC_MODE, min}
+      - class_path: lightning.pytorch.callbacks.EarlyStopping
+        init_args:
+          min_delta: 0
+          patience: ${oc.env:PATIENCE, 5}
+          monitor: *MONITOR_METRIC
+          mode: *MONITOR_METRIC_MODE
+    logger:
+      - class_path: lightning.pytorch.loggers.TensorBoardLogger
+        init_args:
+          save_dir: *OUTPUT_ROOT
+          name: ""
+      - class_path: lightning.pytorch.loggers.CSVLogger
+        init_args:
+          save_dir: *OUTPUT_ROOT
+          name: ""
+model:
+  class_path: eva.HeadModule
+  init_args:
+    head:
+      class_path: eva.vision.models.networks.ABMIL
+      init_args:
+        input_size: ${oc.env:IN_FEATURES, 1536}
+        output_size: &NUM_CLASSES 6
+        projected_input_size: 128
+    criterion: torch.nn.CrossEntropyLoss
+    optimizer:
+      class_path: torch.optim.AdamW
+      init_args:
+        lr: ${oc.env:LR_VALUE, 0.001}
+        betas: [0.9, 0.999]
+    metrics:
+      common:
+        - class_path: eva.metrics.AverageLoss
+        - class_path: eva.metrics.MulticlassClassificationMetrics
+          init_args:
+            num_classes: *NUM_CLASSES
+        - class_path: torchmetrics.classification.MulticlassCohenKappa
+          init_args:
+            num_classes: *NUM_CLASSES
+            weights: quadratic
+data:
+  class_path: eva.DataModule
+  init_args:
+    datasets:
+      train:
+        class_path: eva.datasets.MultiEmbeddingsClassificationDataset
+        init_args: &DATASET_ARGS
+          root: &DATASET_EMBEDDINGS_ROOT ${oc.env:EMBEDDINGS_ROOT, ./data/embeddings/openmidnight/panda}
+          manifest_file: manifest_cross_site_radboud_train_fold_${oc.env:FOLD, 0}.csv
+          split: train
+          embeddings_transforms:
+            class_path: eva.core.data.transforms.Pad2DTensor
+            init_args:
+              pad_size: ${oc.env:N_PATCHES, 5000}
+      val:
+        class_path: eva.datasets.MultiEmbeddingsClassificationDataset
+        init_args:
+          <<: *DATASET_ARGS
+          split: val
+      test:
+        class_path: eva.datasets.MultiEmbeddingsClassificationDataset
+        init_args:
+          <<: *DATASET_ARGS
+          split: test
+    dataloaders:
+      train:
+        batch_size: &BATCH_SIZE ${oc.env:BATCH_SIZE, 32}
+        num_workers: &N_DATA_WORKERS ${oc.env:N_DATA_WORKERS, 4}
+        shuffle: true
+      val:
+        batch_size: *BATCH_SIZE
+        num_workers: *N_DATA_WORKERS
+      test:
+        batch_size: *BATCH_SIZE
+        num_workers: *N_DATA_WORKERS
