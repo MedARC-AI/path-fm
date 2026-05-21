@@ -1194,21 +1194,25 @@ def do_train(cfg, model, resume=False):
 
         optimizer.zero_grad(set_to_none=True)
 
-        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
+        loss_dict, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp)
 
         # clip gradients
 
         if fp16_scaler is not None:
+            fp16_scaler.unscale_(optimizer)
             if cfg.optim.clip_grad:
-                fp16_scaler.unscale_(optimizer)
                 for v in model.student.values():
                     v.clip_grad_norm_(cfg.optim.clip_grad)
+            if model.do_adv:
+                metrics_dict.update(model._compute_grad_norms())
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
         else:
             if cfg.optim.clip_grad:
                 for v in model.student.values():
                     v.clip_grad_norm_(cfg.optim.clip_grad)
+            if model.do_adv:
+                metrics_dict.update(model._compute_grad_norms())
             optimizer.step()
 
         # perform teacher EMA update
@@ -1220,13 +1224,17 @@ def do_train(cfg, model, resume=False):
         if distributed.get_global_size() > 1:
             for v in loss_dict.values():
                 torch.distributed.all_reduce(v)
-        loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
+            for v in metrics_dict.values():
+                torch.distributed.all_reduce(v)
+        world_size = distributed.get_global_size()
+        loss_dict_reduced = {k: v.item() / world_size for k, v in loss_dict.items()}
+        metrics_dict_reduced = {k: v.item() / world_size for k, v in metrics_dict.items()}
 
         if math.isnan(sum(loss_dict_reduced.values())):
             print(sum(loss_dict_reduced.values()))
             logger.info("NaN detected")
             print(data["indexes"])
-            
+
             for name, param in model.named_parameters():
                 if torch.isnan(param.data).any():
                     print(f"NaNs found in parameter: {name}")
@@ -1239,8 +1247,13 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(current_batch_size=current_batch_size)
-        metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
-        
+        metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced, **metrics_dict_reduced)
+
+        if distributed.is_main_process() and iteration % 10 == 0:
+            loss_str = "  ".join(f"{k}={v:.4f}" for k, v in sorted(loss_dict_reduced.items()))
+            metrics_str = "  ".join(f"{k}={v:.4f}" for k, v in sorted(metrics_dict_reduced.items()))
+            print(f"[step {iteration:05d}]  total={losses_reduced:.4f}  {loss_str}  {metrics_str}", flush=True)
+
         if distributed.is_main_process():
             scalar_logs = {
                 "Learning Rate": lr,
@@ -1250,7 +1263,7 @@ def do_train(cfg, model, resume=False):
             }
             if cfg.adversarial.loss_weight > 0:
                 scalar_logs["lambda_adv"] = cfg.adversarial.loss_weight
-            wandb.log({**scalar_logs, **loss_dict_reduced}, step=iteration)
+            wandb.log({**scalar_logs, **loss_dict_reduced, **metrics_dict_reduced}, step=iteration)
     
         # Synchronize the GPU to ensure all operations are complete before measuring
         torch.cuda.synchronize()
