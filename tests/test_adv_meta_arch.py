@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from unittest.mock import patch, MagicMock
 
-from dinov2.train.ssl_meta_arch import compute_adv_accuracy, compute_grad_norm
+from dinov2.train.ssl_meta_arch import compute_adv_accuracy, compute_grad_norm, compute_param_norm
 
 
 # ── tss_to_idx mapping ────────────────────────────────────────────────────────
@@ -296,3 +296,93 @@ def test_valid_label_fraction_none_valid():
     labels = torch.tensor([-1, -1, -1])
     fraction = (labels >= 0).float().mean()
     assert fraction.item() == pytest.approx(0.0)
+
+
+# ── compute_param_norm ───────────────────────────────────────────────────────
+
+def test_compute_param_norm_known_values():
+    model = nn.Linear(4, 2, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(0.0)
+        model.weight[0, 0] = 3.0
+        model.weight[1, 0] = 4.0
+    assert compute_param_norm(model).item() == pytest.approx(5.0)
+
+
+def test_compute_param_norm_with_bias():
+    model = nn.Linear(1, 1, bias=True)
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+        model.bias.fill_(4.0)
+    assert compute_param_norm(model).item() == pytest.approx(5.0)
+
+
+def test_compute_param_norm_empty_module():
+    model = nn.Sequential()
+    assert compute_param_norm(model).item() == pytest.approx(0.0)
+
+
+# ── CLS std/norm metrics logic ───────────────────────────────────────────────
+
+def test_cls_std_detects_collapse():
+    """Collapsed features (all identical) have zero std."""
+    tokens = torch.ones(8, 64)
+    assert tokens.std(dim=0).mean().item() == pytest.approx(0.0)
+
+
+def test_cls_std_nonzero_for_varied_features():
+    torch.manual_seed(42)
+    tokens = torch.randn(8, 64)
+    assert tokens.std(dim=0).mean().item() > 0.5
+
+
+def test_cls_norm_mean():
+    tokens = torch.zeros(4, 3)
+    tokens[0] = torch.tensor([3.0, 4.0, 0.0])  # norm = 5
+    tokens[1] = torch.tensor([0.0, 0.0, 5.0])  # norm = 5
+    tokens[2] = torch.tensor([5.0, 0.0, 0.0])  # norm = 5
+    tokens[3] = torch.tensor([0.0, 3.0, 4.0])  # norm = 5
+    assert tokens.norm(dim=-1).mean().item() == pytest.approx(5.0)
+
+
+# ── student-teacher cosine similarity ────────────────────────────────────────
+
+def test_cosine_identical_is_one():
+    tokens = torch.randn(8, 64)
+    cos = F.cosine_similarity(tokens, tokens, dim=-1).mean()
+    assert cos.item() == pytest.approx(1.0)
+
+
+def test_cosine_orthogonal_is_zero():
+    a = torch.tensor([[1.0, 0.0]])
+    b = torch.tensor([[0.0, 1.0]])
+    cos = F.cosine_similarity(a, b, dim=-1).mean()
+    assert cos.item() == pytest.approx(0.0)
+
+
+def test_cosine_opposite_is_minus_one():
+    a = torch.tensor([[1.0, 0.0]])
+    b = torch.tensor([[-1.0, 0.0]])
+    cos = F.cosine_similarity(a, b, dim=-1).mean()
+    assert cos.item() == pytest.approx(-1.0)
+
+
+# ── teacher entropy ──────────────────────────────────────────────────────────
+
+def test_uniform_distribution_max_entropy():
+    """Uniform distribution over K classes → entropy = log(K)."""
+    import math
+    K = 100
+    probs = torch.full((4, K), 1.0 / K)
+    entropy = -(probs * probs.log()).sum(dim=-1).mean()
+    assert entropy.item() == pytest.approx(math.log(K), rel=1e-5)
+
+
+def test_peaked_distribution_low_entropy():
+    """One-hot distribution → entropy ≈ 0."""
+    probs = torch.zeros(4, 10)
+    probs[:, 0] = 1.0
+    entropy = -torch.xlogy(probs, probs).sum(dim=-1).mean()
+    assert entropy.item() == pytest.approx(0.0, abs=1e-5)
+
+

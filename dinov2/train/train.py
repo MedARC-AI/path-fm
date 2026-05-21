@@ -1200,20 +1200,22 @@ def do_train(cfg, model, resume=False):
 
         if fp16_scaler is not None:
             fp16_scaler.unscale_(optimizer)
-            if cfg.optim.clip_grad:
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
-            if model.do_adv:
-                metrics_dict.update(model._compute_grad_norms())
+
+        if model.do_adv:
+            metrics_dict.update(model._compute_grad_norms())
+        if cfg.optim.clip_grad:
+            for v in model.student.values():
+                v.clip_grad_norm_(cfg.optim.clip_grad)
+
+        if fp16_scaler is not None:
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
+            metrics_dict["fp16_scale"] = torch.tensor(fp16_scaler.get_scale(), device=data["collated_global_crops"].device)
         else:
-            if cfg.optim.clip_grad:
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
-            if model.do_adv:
-                metrics_dict.update(model._compute_grad_norms())
             optimizer.step()
+
+        if iteration % 100 == 0:
+            metrics_dict.update(model._compute_param_norms())
 
         # perform teacher EMA update
 

@@ -5,6 +5,7 @@
 
 from functools import partial
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -38,12 +39,24 @@ def compute_adv_accuracy(
     return (preds[valid_mask].argmax(dim=-1) == labels[valid_mask]).float().mean()
 
 
+def _tensor_list_norm(tensors: list[torch.Tensor], fallback_device: torch.device) -> torch.Tensor:
+    if not tensors:
+        return torch.tensor(0.0, device=fallback_device)
+    return torch.stack([t.norm(2) ** 2 for t in tensors]).sum().sqrt()
+
+
 def compute_grad_norm(module: nn.Module) -> torch.Tensor:
-    """L2 norm of all gradients in a module (0 if no grads)."""
+    """L2 norm of all gradients in a module."""
+    device = next((p.device for p in module.parameters()), torch.device("cpu"))
     grads = [p.grad for p in module.parameters() if p.grad is not None]
-    if not grads:
-        return torch.tensor(0.0)
-    return torch.cat([g.flatten() for g in grads]).norm(2)
+    return _tensor_list_norm(grads, device)
+
+
+def compute_param_norm(module: nn.Module) -> torch.Tensor:
+    """L2 norm of all parameters in a module."""
+    device = next((p.device for p in module.parameters()), torch.device("cpu"))
+    params = [p.data for p in module.parameters()]
+    return _tensor_list_norm(params, device)
 
 
 class SSLMetaArch(nn.Module):
@@ -141,6 +154,8 @@ class SSLMetaArch(nn.Module):
             logger.info(f"OPTIONS -- ADVERSARIAL -- n_tss_codes: {len(all_tss_codes)}")
             self.tss_to_idx = {tss: idx for idx, tss in enumerate(sorted(all_tss_codes))}
             num_classes = len(self.tss_to_idx)
+            self.register_buffer("adv_chance_accuracy", torch.tensor(1.0 / num_classes))
+            self.register_buffer("adv_uniform_ce", torch.tensor(math.log(num_classes)))
             self.slide_classifier = SlideClassifier(embed_dim, cfg.adversarial.hidden_dim, num_classes, cfg.adversarial.alpha)
             student_model_dict["slide_classifier"] = self.slide_classifier
             self.adversarial_loss_weight = cfg.adversarial.loss_weight
@@ -182,8 +197,16 @@ class SSLMetaArch(nn.Module):
         disc_norm = compute_grad_norm(self.student.slide_classifier)
         norms["grad_norm_backbone"] = backbone_norm
         norms["grad_norm_discriminator"] = disc_norm
-        if disc_norm > 0:
-            norms["grad_norm_ratio_backbone_disc"] = backbone_norm / disc_norm
+        norms["grad_norm_ratio_backbone_disc"] = backbone_norm / (disc_norm + 1e-8)
+        return norms
+
+    @torch.no_grad()
+    def _compute_param_norms(self) -> dict[str, torch.Tensor]:
+        """Parameter L2 norms — slow drift is fine, sudden spike = divergence."""
+        norms: dict[str, torch.Tensor] = {}
+        norms["param_norm_backbone"] = compute_param_norm(self.student.backbone)
+        if self.do_adv:
+            norms["param_norm_discriminator"] = compute_param_norm(self.student.slide_classifier)
         return norms
 
     def forward_backward(self, images, teacher_temp):
@@ -215,8 +238,8 @@ class SSLMetaArch(nn.Module):
         def get_teacher_output():
             x, n_global_crops_teacher = global_crops, n_global_crops
             teacher_backbone_output_dict = self.teacher.backbone(x, is_training=True)
-            teacher_cls_tokens = teacher_backbone_output_dict["x_norm_clstoken"]
-            teacher_cls_tokens = teacher_cls_tokens.chunk(n_global_crops_teacher)
+            teacher_cls_tokens_raw = teacher_backbone_output_dict["x_norm_clstoken"]
+            teacher_cls_tokens = teacher_cls_tokens_raw.chunk(n_global_crops_teacher)
             # watch out: these are chunked and cat'd in reverse so A is matched to B in the global crops dino loss
             teacher_cls_tokens = torch.cat((teacher_cls_tokens[1], teacher_cls_tokens[0]))
             ibot_teacher_patch_tokens = teacher_backbone_output_dict["x_norm_patchtokens"]
@@ -281,9 +304,9 @@ class SSLMetaArch(nn.Module):
             else:
                 raise NotImplementedError
 
-            return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered
+            return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered, teacher_cls_tokens_raw
 
-        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered = get_teacher_output()
+        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered, teacher_global_cls_tokens = get_teacher_output()
         reshard_fsdp_model(self.teacher)
 
         loss_dict = {}
@@ -417,9 +440,11 @@ class SSLMetaArch(nn.Module):
                 dtype=torch.long,
                 device=global_crops.device,
             )
-            # If every sample in the batch has an excluded TSS code, skip to avoid NaN from
-            # F.cross_entropy(reduction='mean') dividing by zero valid samples.
-            if (adversarial_labels >= 0).any():
+            valid_mask = adversarial_labels >= 0
+            # adv_unique_tss_count: per-rank count; all-reduce averages across ranks, not global unique
+            metrics_dict["adv_unique_tss_count"] = torch.tensor(float(len(set(slide_ids))), device=global_crops.device)
+            metrics_dict["adv_valid_tss_count"] = valid_mask.sum().float()
+            if valid_mask.any():
                 # collate ordering: outer=crop, inner=sample → use repeat (not repeat_interleave)
                 global_slide_ids = adversarial_labels.repeat(n_global_crops)
                 local_slide_ids = adversarial_labels.repeat(n_local_crops)
@@ -436,7 +461,6 @@ class SSLMetaArch(nn.Module):
                 loss_dict["global_adv_loss"] = global_adv_loss
                 loss_dict["local_adv_loss"] = local_adv_loss
 
-                valid_mask = adversarial_labels >= 0
                 global_valid = valid_mask.repeat(n_global_crops)
                 local_valid = valid_mask.repeat(n_local_crops)
                 metrics_dict["global_adv_accuracy"] = compute_adv_accuracy(
@@ -448,6 +472,26 @@ class SSLMetaArch(nn.Module):
                 metrics_dict["adv_valid_label_fraction"] = valid_mask.float().mean()
 
                 loss_accumulator += self.adversarial_loss_weight * adv_loss
+
+        # ── representation health metrics (every step, cheap) ──
+        with torch.no_grad():
+            s_cls = student_global_cls_tokens.float()
+            t_cls = teacher_global_cls_tokens.float()
+            metrics_dict["student_global_cls_std_mean"] = s_cls.std(dim=0).mean()
+            metrics_dict["teacher_global_cls_std_mean"] = t_cls.std(dim=0).mean()
+            metrics_dict["student_global_cls_norm_mean"] = s_cls.norm(dim=-1).mean()
+
+            cos_sim = F.cosine_similarity(s_cls, t_cls, dim=-1)
+            metrics_dict["student_teacher_cosine"] = cos_sim.mean()
+
+            if do_dino:
+                teacher_probs = teacher_dino_softmaxed_centered_list.flatten(0, 1).float()
+                metrics_dict["teacher_dino_entropy"] = -torch.xlogy(teacher_probs, teacher_probs).sum(dim=-1).mean()
+
+        if self.do_adv:
+            metrics_dict["adv_chance_accuracy"] = self.adv_chance_accuracy
+            # unweighted reference; actual CE uses class weights so will differ slightly
+            metrics_dict["adv_uniform_ce"] = self.adv_uniform_ce
 
         self.backprop_loss(loss_accumulator)
 
