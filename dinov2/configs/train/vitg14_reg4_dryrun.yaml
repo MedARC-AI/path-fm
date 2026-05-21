@@ -1,0 +1,57 @@
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+  do_kde: True
+  kde_loss_weight: 0.05
+  koleo_loss_weight: 0
+  do_koleo: False
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.45
+  separate_head: true
+  head_n_prototypes: 131072
+train:
+  sample_list_path: /block/TCGA/sample_dataset_30.txt
+  streaming_from_hf: false
+  batch_size_per_gpu: 16
+  centering: sinkhorn_knopp
+  use_pretrained: false       # skip torch.hub download; random init sufficient for dry run
+  OFFICIAL_EPOCH_LENGTH: 100  # 100 steps total (1 epoch × 100)
+  num_workers: 4
+  prefetch_factor: 2
+  skip_checkpointer: true     # no checkpoint writes
+student:
+  arch: vit_giant2
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+  num_register_tokens: 4
+  interpolate_antialias: true
+  interpolate_offset: 0.0
+teacher:
+  momentum_teacher: 0.994
+optim:
+  epochs: 1
+  early_stop: 1
+  weight_decay_end: 0.2
+  base_lr: 3.0e-04
+  warmup_epochs: 0            # warmup_iters must not exceed total steps (100)
+  layerwise_decay: 1.0
+crops:
+  local_crops_size: 98
+evaluation:
+  eval_period_iterations: -1  # -1 disables the >= 0 check; suppresses step-0 eval
+  bach_root: /block/eva-data/bach
+  breakhis_root: /block/eva-data/breakhis
+  pcam_root: /block/eva-data/patch_camelyon
+adversarial:
+  loss_weight: 50.0
+  alpha: 1.0
+  hidden_dim: 256
+  average_crop: false
+  local_crop_weight: 1.0
+  min_wsi_count: 10
