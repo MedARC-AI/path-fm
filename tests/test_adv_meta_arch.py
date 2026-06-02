@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from unittest.mock import patch, MagicMock
 
-from dinov2.train.ssl_meta_arch import compute_adv_accuracy, compute_grad_norm, compute_param_norm
+from dinov2.train.ssl_meta_arch import compute_adv_accuracy, compute_grad_norm, compute_param_norm, _CLASSIFIER_KEYS
 
 
 # ── tss_to_idx mapping ────────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ def test_update_teacher_ema_skips_slide_classifier():
     student_param_list = []
     teacher_param_list = []
     for k in student_keys:
-        if k == "slide_classifier":
+        if k in _CLASSIFIER_KEYS:
             continue
         for ms, mt in zip(fake_get_fsdp(student_keys[k]), fake_get_fsdp(teacher_keys[k])):
             student_param_list += ms.params
@@ -386,3 +386,59 @@ def test_peaked_distribution_low_entropy():
     assert entropy.item() == pytest.approx(0.0, abs=1e-5)
 
 
+# ── _CLASSIFIER_KEYS ────────────────────────────────────────────────────────
+
+def test_classifier_keys_contains_both_heads():
+    assert "slide_classifier" in _CLASSIFIER_KEYS
+    assert "scanner_classifier" in _CLASSIFIER_KEYS
+
+
+def test_teacher_excludes_scanner_classifier():
+    student_model_dict = {"backbone": nn.Linear(8, 8), "scanner_classifier": nn.Linear(8, 3)}
+    teacher_model_dict = {"backbone": nn.Linear(8, 8)}
+    student = nn.ModuleDict(student_model_dict)
+    teacher = nn.ModuleDict(teacher_model_dict)
+    assert "scanner_classifier" in student
+    assert "scanner_classifier" not in teacher
+
+
+def test_update_teacher_skips_scanner_classifier():
+    student_keys = {"backbone": nn.Linear(4, 4), "scanner_classifier": nn.Linear(4, 2)}
+    teacher_keys = {"backbone": nn.Linear(4, 4)}
+    sc_weight = student_keys["scanner_classifier"].weight.data.clone()
+
+    class _W:
+        def __init__(self, m):
+            self.params = list(m.parameters())
+
+    student_p, teacher_p = [], []
+    for k in student_keys:
+        if k in _CLASSIFIER_KEYS:
+            continue
+        for ms, mt in zip([_W(student_keys[k])], [_W(teacher_keys[k])]):
+            student_p += ms.params
+            teacher_p += mt.params
+
+    with torch.no_grad():
+        torch._foreach_mul_(teacher_p, 0.9)
+        torch._foreach_add_(teacher_p, student_p, alpha=0.1)
+
+    assert torch.allclose(student_keys["scanner_classifier"].weight.data, sc_weight)
+
+
+# ── scanner label construction ───────────────────────────────────────────────
+
+def test_scanner_label_lookup():
+    slide_to_scanner = {"TCGA-AB-1234-01Z": "SS100", "TCGA-CD-5678-01Z": "SS200"}
+    scanner_to_idx = {"SS100": 0, "SS200": 1}
+    slide_names = ["TCGA-AB-1234-01Z", "TCGA-CD-5678-01Z", "TCGA-XX-9999-01Z"]
+    labels = [scanner_to_idx.get(slide_to_scanner.get(n, ""), -1) for n in slide_names]
+    assert labels == [0, 1, -1]
+
+
+def test_scanner_label_all_unknown():
+    slide_to_scanner = {"TCGA-AB-1234-01Z": "SS100"}
+    scanner_to_idx = {"SS100": 0}
+    slide_names = ["UNKNOWN-1", "UNKNOWN-2"]
+    labels = [scanner_to_idx.get(slide_to_scanner.get(n, ""), -1) for n in slide_names]
+    assert labels == [-1, -1]

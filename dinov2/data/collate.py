@@ -21,6 +21,7 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
         indexes.append(sample[1])
 
     slide_ids = [sample[2] for sample in samples_list] if len(samples_list[0]) > 2 else None
+    slide_names = [sample[3] for sample in samples_list] if len(samples_list[0]) > 3 else None
 
     samples_list = images
 
@@ -62,4 +63,5 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
         "n_masked_patches": torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
         "indexes": indexes,
         "slide_ids": slide_ids,
+        "slide_names": slide_names,
     }

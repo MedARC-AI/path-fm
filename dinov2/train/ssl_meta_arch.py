@@ -31,6 +31,8 @@ except ImportError:
 
 logger = logging.getLogger("dinov2")
 
+_CLASSIFIER_KEYS = {"slide_classifier", "scanner_classifier"}
+
 
 def compute_adv_accuracy(
     preds: torch.Tensor, labels: torch.Tensor, valid_mask: torch.Tensor
@@ -60,7 +62,8 @@ def compute_param_norm(module: nn.Module) -> torch.Tensor:
 
 
 class SSLMetaArch(nn.Module):
-    def __init__(self, cfg, all_tss_codes=None, class_weights=None):
+    def __init__(self, cfg, all_tss_codes=None, class_weights=None,
+                 all_scanner_ids=None, scanner_class_weights=None, slide_to_scanner=None):
         super().__init__()
         self.cfg = cfg
         self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
@@ -86,6 +89,7 @@ class SSLMetaArch(nn.Module):
         self.do_kde = cfg.dino.kde_loss_weight > 0
         self.do_ibot = cfg.ibot.loss_weight > 0
         self.do_adv = cfg.adversarial.loss_weight > 0
+        self.do_scanner = cfg.adversarial.scanner.loss_weight > 0
         self.ibot_separate_head = cfg.ibot.separate_head
 
         logger.info("OPTIONS -- DINO")
@@ -146,24 +150,45 @@ class SSLMetaArch(nn.Module):
             else:
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
 
-        logger.info("OPTIONS -- ADVERSARIAL")
+        logger.info("OPTIONS -- ADVERSARIAL (TSS)")
         if self.do_adv:
             assert all_tss_codes, "all_tss_codes must be provided when adversarial.loss_weight > 0"
-            logger.info(f"OPTIONS -- ADVERSARIAL -- loss_weight: {cfg.adversarial.loss_weight}")
-            logger.info(f"OPTIONS -- ADVERSARIAL -- alpha: {cfg.adversarial.alpha}")
-            logger.info(f"OPTIONS -- ADVERSARIAL -- n_tss_codes: {len(all_tss_codes)}")
+            logger.info(f"OPTIONS -- ADVERSARIAL TSS -- loss_weight: {cfg.adversarial.loss_weight}")
+            logger.info(f"OPTIONS -- ADVERSARIAL TSS -- alpha: {cfg.adversarial.alpha}")
+            logger.info(f"OPTIONS -- ADVERSARIAL TSS -- n_tss_codes: {len(all_tss_codes)}")
             self.tss_to_idx = {tss: idx for idx, tss in enumerate(sorted(all_tss_codes))}
-            num_classes = len(self.tss_to_idx)
-            self.register_buffer("adv_chance_accuracy", torch.tensor(1.0 / num_classes))
-            self.register_buffer("adv_uniform_ce", torch.tensor(math.log(num_classes)))
-            self.slide_classifier = SlideClassifier(embed_dim, cfg.adversarial.hidden_dim, num_classes, cfg.adversarial.alpha)
+            num_tss = len(self.tss_to_idx)
+            self.register_buffer("tss_chance_accuracy", torch.tensor(1.0 / num_tss))
+            self.register_buffer("tss_uniform_ce", torch.tensor(math.log(num_tss)))
+            self.slide_classifier = SlideClassifier(embed_dim, cfg.adversarial.hidden_dim, num_tss, cfg.adversarial.alpha)
             student_model_dict["slide_classifier"] = self.slide_classifier
             self.adversarial_loss_weight = cfg.adversarial.loss_weight
             self.adversarial_local_crop_weight = cfg.adversarial.local_crop_weight
             if class_weights is not None:
-                self.register_buffer("adv_class_weights", class_weights)
+                self.register_buffer("tss_class_weights", class_weights)
             else:
-                self.adv_class_weights = None
+                self.tss_class_weights = None
+
+        logger.info("OPTIONS -- ADVERSARIAL (SCANNER)")
+        if self.do_scanner:
+            assert all_scanner_ids, "all_scanner_ids must be provided when adversarial.scanner.loss_weight > 0"
+            assert slide_to_scanner is not None
+            logger.info(f"OPTIONS -- ADVERSARIAL SCANNER -- loss_weight: {cfg.adversarial.scanner.loss_weight}")
+            logger.info(f"OPTIONS -- ADVERSARIAL SCANNER -- alpha: {cfg.adversarial.scanner.alpha}")
+            logger.info(f"OPTIONS -- ADVERSARIAL SCANNER -- n_scanner_ids: {len(all_scanner_ids)}")
+            self.scanner_to_idx = {s: idx for idx, s in enumerate(sorted(all_scanner_ids))}
+            self.slide_to_scanner = slide_to_scanner
+            num_scanners = len(self.scanner_to_idx)
+            self.register_buffer("scanner_chance_accuracy", torch.tensor(1.0 / num_scanners))
+            self.register_buffer("scanner_uniform_ce", torch.tensor(math.log(num_scanners)))
+            self.scanner_classifier = SlideClassifier(embed_dim, cfg.adversarial.scanner.hidden_dim, num_scanners, cfg.adversarial.scanner.alpha)
+            student_model_dict["scanner_classifier"] = self.scanner_classifier
+            self.scanner_loss_weight = cfg.adversarial.scanner.loss_weight
+            self.scanner_local_crop_weight = cfg.adversarial.scanner.local_crop_weight
+            if scanner_class_weights is not None:
+                self.register_buffer("scanner_class_weights", scanner_class_weights)
+            else:
+                self.scanner_class_weights = None
 
         self.need_to_synchronize_fsdp_streams = True
 
@@ -174,6 +199,16 @@ class SSLMetaArch(nn.Module):
         for p in self.teacher.parameters():
             p.requires_grad = False
         logger.info(f"Student and Teacher are built: they are both {cfg.student.arch} network.")
+
+    def set_adv_alpha(self, tss_alpha=None, scanner_alpha=None):
+        if tss_alpha is not None and self.do_adv:
+            clf = self.student.slide_classifier
+            grl = clf.module.grl if hasattr(clf, "module") else clf.grl
+            grl.alpha = tss_alpha
+        if scanner_alpha is not None and self.do_scanner:
+            clf = self.student.scanner_classifier
+            grl = clf.module.grl if hasattr(clf, "module") else clf.grl
+            grl.alpha = scanner_alpha
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -186,18 +221,24 @@ class SSLMetaArch(nn.Module):
 
     @torch.no_grad()
     def _compute_grad_norms(self) -> dict[str, torch.Tensor]:
-        """Gradient L2 norms for the backbone vs discriminator after backward.
+        """Gradient L2 norms for the backbone vs adversarial heads after backward.
 
         Under FSDP each rank holds a shard; all-reducing and dividing by world_size
         gives the average-shard norm, not the global L2 norm. The ratio is still a
-        valid monotone signal for comparing backbone vs discriminator magnitude.
+        valid monotone signal for comparing backbone vs head magnitude.
         """
         norms: dict[str, torch.Tensor] = {}
+        _clean = lambda t: torch.nan_to_num(t, nan=0.0, posinf=1.0e6, neginf=-1.0e6)
         backbone_norm = compute_grad_norm(self.student.backbone)
-        disc_norm = compute_grad_norm(self.student.slide_classifier)
-        norms["grad_norm_backbone"] = backbone_norm
-        norms["grad_norm_discriminator"] = disc_norm
-        norms["grad_norm_ratio_backbone_disc"] = backbone_norm / (disc_norm + 1e-8)
+        norms["grad_norm_backbone"] = _clean(backbone_norm)
+        if self.do_adv:
+            tss_norm = compute_grad_norm(self.student.slide_classifier)
+            norms["grad_norm_tss_classifier"] = _clean(tss_norm)
+            norms["grad_norm_ratio_backbone_tss"] = _clean(backbone_norm / (tss_norm + 1e-8))
+        if self.do_scanner:
+            scanner_norm = compute_grad_norm(self.student.scanner_classifier)
+            norms["grad_norm_scanner_classifier"] = _clean(scanner_norm)
+            norms["grad_norm_ratio_backbone_scanner"] = _clean(backbone_norm / (scanner_norm + 1e-8))
         return norms
 
     @torch.no_grad()
@@ -206,8 +247,53 @@ class SSLMetaArch(nn.Module):
         norms: dict[str, torch.Tensor] = {}
         norms["param_norm_backbone"] = compute_param_norm(self.student.backbone)
         if self.do_adv:
-            norms["param_norm_discriminator"] = compute_param_norm(self.student.slide_classifier)
+            norms["param_norm_tss_classifier"] = compute_param_norm(self.student.slide_classifier)
+        if self.do_scanner:
+            norms["param_norm_scanner_classifier"] = compute_param_norm(self.student.scanner_classifier)
         return norms
+
+    def _adv_head_forward(
+        self, classifier, label_indices, raw_labels, class_weights,
+        loss_weight, local_crop_weight, chance_accuracy, uniform_ce,
+        student_global_cls, student_local_cls,
+        n_global_crops, n_local_crops, prefix,
+    ):
+        device = label_indices.device
+        loss_dict: dict[str, torch.Tensor] = {}
+        metrics_dict: dict[str, torch.Tensor] = {}
+        loss_contribution = torch.tensor(0.0, device=device)
+
+        valid_mask = label_indices >= 0
+        metrics_dict[f"{prefix}_unique_count"] = torch.tensor(float(len(set(raw_labels))), device=device)
+        metrics_dict[f"{prefix}_valid_count"] = valid_mask.sum().float()
+
+        if valid_mask.any():
+            global_ids = label_indices.repeat(n_global_crops)
+            local_ids = label_indices.repeat(n_local_crops)
+
+            with autocast(dtype=torch.float16):
+                global_preds = classifier(student_global_cls)
+                local_preds = classifier(student_local_cls)
+                global_loss = F.cross_entropy(global_preds, global_ids, weight=class_weights, ignore_index=-1)
+                local_loss = F.cross_entropy(local_preds, local_ids, weight=class_weights, ignore_index=-1)
+                adv_loss = global_loss + local_crop_weight * local_loss
+
+            loss_dict[f"{prefix}_global_loss"] = global_loss
+            loss_dict[f"{prefix}_local_loss"] = local_loss
+
+            global_valid = valid_mask.repeat(n_global_crops)
+            local_valid = valid_mask.repeat(n_local_crops)
+            metrics_dict[f"{prefix}_global_accuracy"] = compute_adv_accuracy(global_preds, global_ids, global_valid)
+            metrics_dict[f"{prefix}_local_accuracy"] = compute_adv_accuracy(local_preds, local_ids, local_valid)
+            metrics_dict[f"{prefix}_valid_label_fraction"] = valid_mask.float().mean()
+
+            loss_contribution = loss_weight * adv_loss
+
+        # unweighted reference; actual CE uses class weights so will differ slightly
+        metrics_dict[f"{prefix}_chance_accuracy"] = chance_accuracy.clone()
+        metrics_dict[f"{prefix}_uniform_ce"] = uniform_ce.clone()
+
+        return loss_contribution, loss_dict, metrics_dict
 
     def forward_backward(self, images, teacher_temp):
         n_global_crops = 2
@@ -432,46 +518,42 @@ class SSLMetaArch(nn.Module):
             # accumulate loss
             loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
-        # Adversarial loss
+        # Adversarial losses
         if self.do_adv:
             slide_ids = images["slide_ids"]
-            adversarial_labels = torch.tensor(
+            tss_labels = torch.tensor(
                 [self.tss_to_idx.get(tss, -1) for tss in slide_ids],
-                dtype=torch.long,
-                device=global_crops.device,
+                dtype=torch.long, device=global_crops.device,
             )
-            valid_mask = adversarial_labels >= 0
-            # adv_unique_tss_count: per-rank count; all-reduce averages across ranks, not global unique
-            metrics_dict["adv_unique_tss_count"] = torch.tensor(float(len(set(slide_ids))), device=global_crops.device)
-            metrics_dict["adv_valid_tss_count"] = valid_mask.sum().float()
-            if valid_mask.any():
-                # collate ordering: outer=crop, inner=sample → use repeat (not repeat_interleave)
-                global_slide_ids = adversarial_labels.repeat(n_global_crops)
-                local_slide_ids = adversarial_labels.repeat(n_local_crops)
+            tss_loss, tss_losses, tss_metrics = self._adv_head_forward(
+                self.student.slide_classifier, tss_labels, slide_ids,
+                self.tss_class_weights, self.adversarial_loss_weight,
+                self.adversarial_local_crop_weight,
+                self.tss_chance_accuracy, self.tss_uniform_ce,
+                student_global_cls_tokens, student_local_cls_tokens,
+                n_global_crops, n_local_crops, "tss",
+            )
+            loss_dict.update(tss_losses)
+            metrics_dict.update(tss_metrics)
+            loss_accumulator += tss_loss
 
-                with autocast(dtype=torch.float16):
-                    global_slide_preds = self.student.slide_classifier(student_global_cls_tokens)
-                    local_slide_preds = self.student.slide_classifier(student_local_cls_tokens)
-
-                    global_adv_loss = F.cross_entropy(global_slide_preds, global_slide_ids, weight=self.adv_class_weights, ignore_index=-1)
-                    local_adv_loss = F.cross_entropy(local_slide_preds, local_slide_ids, weight=self.adv_class_weights, ignore_index=-1)
-
-                    adv_loss = global_adv_loss + self.adversarial_local_crop_weight * local_adv_loss
-
-                loss_dict["global_adv_loss"] = global_adv_loss
-                loss_dict["local_adv_loss"] = local_adv_loss
-
-                global_valid = valid_mask.repeat(n_global_crops)
-                local_valid = valid_mask.repeat(n_local_crops)
-                metrics_dict["global_adv_accuracy"] = compute_adv_accuracy(
-                    global_slide_preds, global_slide_ids, global_valid
-                )
-                metrics_dict["local_adv_accuracy"] = compute_adv_accuracy(
-                    local_slide_preds, local_slide_ids, local_valid
-                )
-                metrics_dict["adv_valid_label_fraction"] = valid_mask.float().mean()
-
-                loss_accumulator += self.adversarial_loss_weight * adv_loss
+        if self.do_scanner:
+            slide_names = images["slide_names"]
+            scanner_labels = torch.tensor(
+                [self.scanner_to_idx.get(self.slide_to_scanner.get(n, ""), -1) for n in slide_names],
+                dtype=torch.long, device=global_crops.device,
+            )
+            scanner_loss, scanner_losses, scanner_metrics = self._adv_head_forward(
+                self.student.scanner_classifier, scanner_labels, slide_names,
+                self.scanner_class_weights, self.scanner_loss_weight,
+                self.scanner_local_crop_weight,
+                self.scanner_chance_accuracy, self.scanner_uniform_ce,
+                student_global_cls_tokens, student_local_cls_tokens,
+                n_global_crops, n_local_crops, "scanner",
+            )
+            loss_dict.update(scanner_losses)
+            metrics_dict.update(scanner_metrics)
+            loss_accumulator += scanner_loss
 
         # ── representation health metrics (every step, cheap) ──
         with torch.no_grad():
@@ -487,11 +569,6 @@ class SSLMetaArch(nn.Module):
             if do_dino:
                 teacher_probs = teacher_dino_softmaxed_centered_list.flatten(0, 1).float()
                 metrics_dict["teacher_dino_entropy"] = -torch.xlogy(teacher_probs, teacher_probs).sum(dim=-1).mean()
-
-        if self.do_adv:
-            metrics_dict["adv_chance_accuracy"] = self.adv_chance_accuracy
-            # unweighted reference; actual CE uses class weights so will differ slightly
-            metrics_dict["adv_uniform_ce"] = self.adv_uniform_ce
 
         self.backprop_loss(loss_accumulator)
 
@@ -514,7 +591,7 @@ class SSLMetaArch(nn.Module):
         teacher_param_list = []
         with torch.no_grad():
             for k in self.student.keys():
-                if k == "slide_classifier":
+                if k in _CLASSIFIER_KEYS:
                     continue
                 for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
                     student_param_list += ms.params
@@ -551,13 +628,12 @@ class SSLMetaArch(nn.Module):
             raise NotImplementedError
         # below will synchronize all student subnetworks across gpus:
         for k, v in self.student.items():
-            if k != "slide_classifier":
+            if k not in _CLASSIFIER_KEYS:
                 self.teacher[k].load_state_dict(self.student[k].state_dict())
                 student_model_cfg = self.cfg.compute_precision.student[k]
                 self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
                 teacher_model_cfg = self.cfg.compute_precision.teacher[k]
                 self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
             else:
-                # teacher has no slide_classifier; FSDP-wrap student only (matches advdino pattern)
                 student_model_cfg = self.cfg.compute_precision.student[k]
                 self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])

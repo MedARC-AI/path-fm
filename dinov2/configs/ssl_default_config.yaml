@@ -34,6 +34,12 @@ compute_precision:
         param_dtype: fp16
         reduce_dtype: fp32
         buffer_dtype: fp32
+    scanner_classifier:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
     dino_head:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
@@ -132,3 +138,10 @@ adversarial:
   average_crop: false
   local_crop_weight: 1.0
   min_wsi_count: 10
+  scanner:
+    loss_weight: 0.0
+    alpha: 1.0
+    hidden_dim: 256
+    local_crop_weight: 1.0
+    metadata_path: ''
+    min_scanner_count: 5

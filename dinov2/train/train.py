@@ -1190,6 +1190,19 @@ def do_train(cfg, model, resume=False):
         last_layer_lr = last_layer_lr_schedule[iteration]
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
+        # adversarial alpha warmup: linear ramp from 0 to target over warmup_iters
+        tss_alpha = None
+        scanner_alpha = None
+        if model.do_adv:
+            warmup_iters = getattr(cfg.adversarial, "warmup_iters", 0)
+            target = cfg.adversarial.alpha
+            tss_alpha = target * min(1.0, iteration / max(warmup_iters, 1)) if warmup_iters > 0 else target
+        if model.do_scanner:
+            warmup_iters_s = getattr(cfg.adversarial.scanner, "warmup_iters", 0)
+            target_s = cfg.adversarial.scanner.alpha
+            scanner_alpha = target_s * min(1.0, iteration / max(warmup_iters_s, 1)) if warmup_iters_s > 0 else target_s
+        model.set_adv_alpha(tss_alpha, scanner_alpha)
+
         # compute losses
 
         optimizer.zero_grad(set_to_none=True)
@@ -1201,7 +1214,7 @@ def do_train(cfg, model, resume=False):
         if fp16_scaler is not None:
             fp16_scaler.unscale_(optimizer)
 
-        if model.do_adv:
+        if model.do_adv or model.do_scanner:
             metrics_dict.update(model._compute_grad_norms())
         if cfg.optim.clip_grad:
             for v in model.student.values():
@@ -1210,7 +1223,7 @@ def do_train(cfg, model, resume=False):
         if fp16_scaler is not None:
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
-            metrics_dict["fp16_scale"] = torch.tensor(fp16_scaler.get_scale(), device=data["collated_global_crops"].device)
+            metrics_dict["fp16_scale"] = torch.tensor(fp16_scaler.get_scale(), device=torch.device("cuda"))
         else:
             optimizer.step()
 
@@ -1224,9 +1237,20 @@ def do_train(cfg, model, resume=False):
         # logging
 
         if distributed.get_global_size() > 1:
-            for v in loss_dict.values():
+            gpu = torch.device("cuda")
+            for k in list(loss_dict.keys()):
+                v = loss_dict[k]
+                if v.device.type != "cuda":
+                    logger.warning(f"CPU tensor in loss_dict: {k}")
+                    v = v.to(gpu)
+                    loss_dict[k] = v
                 torch.distributed.all_reduce(v)
-            for v in metrics_dict.values():
+            for k in list(metrics_dict.keys()):
+                v = metrics_dict[k]
+                if v.device.type != "cuda":
+                    logger.warning(f"CPU tensor in metrics_dict: {k}")
+                    v = v.to(gpu)
+                    metrics_dict[k] = v
                 torch.distributed.all_reduce(v)
         world_size = distributed.get_global_size()
         loss_dict_reduced = {k: v.item() / world_size for k, v in loss_dict.items()}
@@ -1265,6 +1289,12 @@ def do_train(cfg, model, resume=False):
             }
             if cfg.adversarial.loss_weight > 0:
                 scalar_logs["lambda_adv"] = cfg.adversarial.loss_weight
+                if tss_alpha is not None:
+                    scalar_logs["tss_grl_alpha"] = tss_alpha
+            if cfg.adversarial.scanner.loss_weight > 0:
+                scalar_logs["lambda_scanner"] = cfg.adversarial.scanner.loss_weight
+                if scanner_alpha is not None:
+                    scalar_logs["scanner_grl_alpha"] = scanner_alpha
             wandb.log({**scalar_logs, **loss_dict_reduced, **metrics_dict_reduced}, step=iteration)
     
         # Synchronize the GPU to ensure all operations are complete before measuring
@@ -1297,6 +1327,38 @@ def _build_tss_mapping(cfg):
     return all_tss_codes, class_weights
 
 
+def _build_scanner_mapping(cfg):
+    import pandas as pd
+    from collections import defaultdict
+    metadata_path = cfg.adversarial.scanner.metadata_path
+    df = pd.read_csv(metadata_path, usecols=["slide_name", "scanner_id"], dtype=str)
+    df = df.dropna(subset=["slide_name", "scanner_id"])
+    slide_to_scanner = dict(zip(df["slide_name"].str.strip(), df["scanner_id"].str.strip()))
+
+    scanner_tiles: dict[str, int] = defaultdict(int)
+    scanner_wsids: dict[str, set] = defaultdict(set)
+    with open(cfg.train.sample_list_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            slide_name = os.path.splitext(os.path.basename(parts[0]))[0]
+            scanner = slide_to_scanner.get(slide_name)
+            if scanner:
+                scanner_tiles[scanner] += 1
+                scanner_wsids[scanner].add(slide_name)
+
+    min_count = cfg.adversarial.scanner.min_scanner_count
+    all_scanner_ids = sorted(s for s, wsids in scanner_wsids.items() if len(wsids) >= min_count)
+    tile_counts = torch.tensor([scanner_tiles[s] for s in all_scanner_ids], dtype=torch.float32)
+    scanner_class_weights = 1.0 / tile_counts
+    scanner_class_weights = scanner_class_weights / scanner_class_weights.mean()
+    n_matched = sum(1 for v in slide_to_scanner if slide_to_scanner[v] in set(all_scanner_ids))
+    logger.info(f"Scanner mapping: {len(all_scanner_ids)} scanners with >= {min_count} WSIs "
+                f"({n_matched} slides matched out of {len(slide_to_scanner)} in CSV)")
+    return all_scanner_ids, scanner_class_weights, slide_to_scanner
+
+
 def main(args):
     cfg = setup(args)
     print(cfg)
@@ -1308,7 +1370,22 @@ def main(args):
         )
         all_tss_codes, class_weights = _build_tss_mapping(cfg)
 
-    model = SSLMetaArch(cfg, all_tss_codes=all_tss_codes, class_weights=class_weights).to(torch.device("cuda"))
+    all_scanner_ids, scanner_class_weights, slide_to_scanner = None, None, None
+    if cfg.adversarial.scanner.loss_weight > 0:
+        assert not cfg.train.streaming_from_hf, (
+            "Scanner adversarial training requires WSI data path (streaming_from_hf must be false)"
+        )
+        assert cfg.adversarial.scanner.metadata_path, (
+            "adversarial.scanner.metadata_path must be set when scanner loss_weight > 0"
+        )
+        all_scanner_ids, scanner_class_weights, slide_to_scanner = _build_scanner_mapping(cfg)
+
+    model = SSLMetaArch(
+        cfg,
+        all_tss_codes=all_tss_codes, class_weights=class_weights,
+        all_scanner_ids=all_scanner_ids, scanner_class_weights=scanner_class_weights,
+        slide_to_scanner=slide_to_scanner,
+    ).to(torch.device("cuda"))
     #Load model here from pretrained.
     if cfg.train.use_pretrained:
         _load_pretrained_backbone(cfg, model)

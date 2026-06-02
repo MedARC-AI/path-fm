@@ -36,7 +36,9 @@ class SlideDataset(ExtendedVisionDataset):
         y = int(y)
         level = int(level)
 
-        tss_code = os.path.basename(path).split('-')[1]
+        basename = os.path.basename(path)
+        tss_code = basename.split('-')[1]
+        slide_name = os.path.splitext(basename)[0]
 
         image = OpenSlide(path)
 
@@ -49,9 +51,9 @@ class SlideDataset(ExtendedVisionDataset):
 
         res = patch.convert("RGB") # Removes alpha - not sure this is the best way to do this thuogh
         if self.transforms is not None:
-            return self.transforms(res, None), index, tss_code
+            return self.transforms(res, None), index, tss_code, slide_name
 
-        return res, None, index, tss_code
+        return res, None, index, tss_code, slide_name
         
     def hsv(self, tile_rgb, patch_size):
         tile = np.array(tile_rgb)

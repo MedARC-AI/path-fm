@@ -20,10 +20,18 @@ class GradientReversalFunction(Function):
 class GradientReversalLayer(nn.Module):
     def __init__(self, alpha):
         super().__init__()
-        self.alpha = alpha
+        self._alpha = float(alpha)
+
+    @property
+    def alpha(self):
+        return self._alpha
+
+    @alpha.setter
+    def alpha(self, value):
+        self._alpha = float(value)
 
     def forward(self, x):
-        return GradientReversalFunction.apply(x, self.alpha)
+        return GradientReversalFunction.apply(x, self._alpha)
 
 
 class SlideClassifier(nn.Module):
