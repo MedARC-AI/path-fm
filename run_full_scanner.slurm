@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
-#SBATCH --job-name=test_run
+#SBATCH --job-name=full_tss_scanner
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-gpu=16
 #SBATCH --gpus-per-task=1
 #SBATCH --time=80:00:00
-#SBATCH --output=full_adv_lam50_%j.out
-#SBATCH --error=full_adv_lam50_%j.err
+#SBATCH --output=full_tss_scanner_%j.out
+#SBATCH --error=full_tss_scanner_%j.err
 #SBATCH --partition=main
 #SBATCH --account=sophont
 #SBATCH --qos top
@@ -22,8 +22,8 @@ export MASTER_PORT=29501
 export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
 # Training config
-CONFIG_FILE="./dinov2/configs/train/vitg14_reg4.yaml"
-OUTPUT_DIR="/tmp/dryrun_full"
+CONFIG_FILE="./dinov2/configs/train/vitg14_reg4_scanner.yaml"
+OUTPUT_DIR="/tmp/dryrun_full_scanner"
 RESUME="False" # set string to "True" to resume from last checkpoint in OUTPUT_DIR if it exists
 
 # Set Python path for imports
