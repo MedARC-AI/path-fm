@@ -23,7 +23,7 @@ dependencies = [
     "huggingface-hub==1.2.3",
     "torch==2.8.0",
     "torchvision",
-    "xformers>=0.0.32.post2",
+    "xformers==0.0.32.post2",
     # for Eva benchmarking:
     "imagesize>=1.4.1",
     "scipy>=1.14.0",

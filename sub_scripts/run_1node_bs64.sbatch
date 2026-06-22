@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=OMvits
+#SBATCH --job-name=OMvits_bs64
 #SBATCH --output=/data/vbelagali/slurm_logs/%j.out
 #SBATCH --error=/data/vbelagali/slurm_logs/%j.err
 #SBATCH --nodes=1
@@ -13,8 +13,8 @@
 set -euo pipefail
 
 # ---- Training config ----
-CONFIG_FILE="./dinov2/configs/train/vits14_reg4.yaml"
-OUTPUT_DIR="/data/vbelagali/vits_run1"
+CONFIG_FILE="./dinov2/configs/train/vits14_reg4_bs64.yaml"
+OUTPUT_DIR="/data/vbelagali/vits_run1_bs64"
 RESUME="True"   # "True" to keep OUTPUT_DIR and resume if checkpoints exist
 
 # ---- Repo env ----

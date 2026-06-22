@@ -17,7 +17,7 @@ train:
   sample_list_path: /block/TCGA/sample_dataset_30.txt # gives paths to svs files for data loading if streaming_from_hf=False
   streaming_from_hf: false # if True, dataset is streamed from HuggingFace Hub, and sample_list_path is ignored. You should lower num_workers to 4
   streaming_dataset_path: medarc/TCGA-12K-parquet
-  batch_size_per_gpu: 128
+  batch_size_per_gpu: 64
   centering: sinkhorn_knopp
   use_pretrained: True
   OFFICIAL_EPOCH_LENGTH: 1250

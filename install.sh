@@ -35,7 +35,9 @@ fi
 
 # Create the project venv (uses the uv-managed Python above).
 uv venv
-uv pip install -e . --torch-backend=auto -p .venv/bin/python
+# Pin the CUDA backend to cu128 (H100 compute nodes). Auto-detection fails on
+# login nodes that have no GPU driver and would fall back to CPU wheels.
+uv pip install -e . --torch-backend=cu128 --index-strategy unsafe-best-match -p .venv/bin/python
 
 # Loosen transformers' hub pin so hub 1.x works.
 .venv/bin/python -c "import transformers.dependency_versions_table as t;from pathlib import Path;p=Path(t.__file__);p.write_text(p.read_text().replace('huggingface-hub>=0.34.0,<1.0','huggingface-hub>=0.34.0'))"
